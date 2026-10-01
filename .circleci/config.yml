@@ -1,0 +1,113 @@
+# 各拡張の公式リポジトリのバージョンを確認し、まだビルドしていないバージョンなら
+# VSIX を作って、このリポジトリの GitHub Release に添付する。
+# Release のタグは「<拡張名>-v<バージョン>」（例: quint-vscode-v0.20.0, alloy-vscode-v0.1.6）。
+#
+# 事前設定:
+#   1. Organization Context「github」に GITHUB_TOKEN を登録する
+#      （このリポジトリに対する Contents: Read and write 権限の Fine-grained PAT）。
+#      hideokamoto/circleci-configurations と同じ Context・同じ変数名を使う。
+#   2. Project Settings > Triggers でスケジュールトリガー（例: 毎日1回）を追加する。
+#      main への push でも起動するが、ビルド済みバージョンは自己スキップする。
+#
+# Release の作成先は、このパイプラインを実行しているリポジトリ
+# （$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME）から自動で決まる。
+version: 2.1
+
+jobs:
+  build-vsix:
+    parameters:
+      upstream-url:
+        type: string
+        description: 拡張の公式リポジトリの clone URL
+      dir:
+        type: string
+        default: "."
+        description: リポジトリ内の拡張のディレクトリ
+      build:
+        type: string
+        description: VSIX を作るコマンド（dir で実行）
+    docker:
+      - image: cimg/node:22.22
+    resource_class: medium
+    environment:
+      GH_VERSION: 2.102.0
+    steps:
+      - run:
+          name: Check GITHUB_TOKEN
+          command: |
+            # GITHUB_TOKEN は github Context から渡す。gh CLI がこの環境変数を自動で使う。
+            if [ -z "${GITHUB_TOKEN:-}" ]; then
+              echo "GITHUB_TOKEN is empty. Configure the 'github' context with a token that has contents:write on this repository." >&2
+              exit 1
+            fi
+            echo "export RELEASE_REPO=${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}" >> "$BASH_ENV"
+      - run:
+          name: Install gh CLI
+          command: |
+            curl -fsSL -o /tmp/gh.tgz \
+              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+            tar -xzf /tmp/gh.tgz -C /tmp
+            echo "export PATH=/tmp/gh_${GH_VERSION}_linux_amd64/bin:\$PATH" >> "$BASH_ENV"
+      - run:
+          name: Clone upstream
+          command: git clone --depth 1 "<< parameters.upstream-url >>" upstream
+      - run:
+          name: Check version
+          working_directory: upstream/<< parameters.dir >>
+          command: |
+            NAME=$(node -p "require('./package.json').name")
+            VERSION=$(node -p "require('./package.json').version")
+            TAG="$NAME-v$VERSION"
+            echo "export NAME=$NAME VERSION=$VERSION TAG=$TAG" >> "$BASH_ENV"
+            # 404 のときだけ「未ビルド」とみなす。認証エラー等で誤って再ビルドしないよう、
+            # それ以外の失敗はジョブを失敗させる。
+            if gh api "repos/$RELEASE_REPO/releases/tags/$TAG" >/dev/null 2>/tmp/gh-err.txt; then
+              echo "$TAG はビルド済みのため終了します"
+              circleci-agent step halt
+            elif grep -q "HTTP 404" /tmp/gh-err.txt; then
+              echo "$TAG は未ビルドのためビルドします"
+            else
+              cat /tmp/gh-err.txt >&2
+              exit 1
+            fi
+      - run:
+          name: Build VSIX
+          working_directory: upstream/<< parameters.dir >>
+          command: |
+            << parameters.build >>
+            mkdir -p /tmp/vsix && cp "$NAME-$VERSION.vsix" /tmp/vsix/
+      - store_artifacts:
+          path: /tmp/vsix
+          destination: vsix
+      - run:
+          name: Publish to GitHub Release
+          working_directory: upstream/<< parameters.dir >>
+          command: |
+            COMMIT=$(git rev-parse --short HEAD)
+            UPSTREAM_NAME=$(git remote get-url origin | sed -E 's#https://github.com/##; s#\.git$##')
+            gh release create "$TAG" "/tmp/vsix/$NAME-$VERSION.vsix" \
+              --repo "$RELEASE_REPO" \
+              --title "$NAME v$VERSION" \
+              --notes "Built from $UPSTREAM_NAME@$COMMIT (<< parameters.dir >>)"
+
+workflows:
+  build:
+    jobs:
+      - build-vsix:
+          name: quint
+          context:
+            # github: GitHub Release の作成に使う GITHUB_TOKEN（contents:write）
+            - github
+          upstream-url: https://github.com/informalsystems/quint.git
+          dir: vscode/quint-vscode
+          build: |
+            npm ci --no-audit --no-fund   # postinstall で server/ の依存も入る
+            npx -y @vscode/vsce package   # vscode:prepublish で tsc -b が走る
+      - build-vsix:
+          name: alloy
+          context:
+            - github
+          upstream-url: https://github.com/DongyuZhao/vscode-alloy.git
+          build: |
+            rm -f .vsixmanifest   # リポジトリに残っている古いマニフェストを除去
+            npx -y @vscode/vsce package --allow-missing-repository --skip-license
