@@ -11,26 +11,31 @@
 #
 # Release の作成先は、このパイプラインを実行しているリポジトリ
 # （$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME）から自動で決まる。
+#
+# 拡張ごとに 3 ジョブに分ける:
+#   check-version（github Context あり）: 上流を clone して package.json を読むだけ。
+#                                          上流のコードは実行しない。
+#   build-vsix   （Context なし）        : 上流の npm スクリプト等を実行して VSIX を作る。
+#                                          上流や依存パッケージのスクリプトに
+#                                          GITHUB_TOKEN を渡さないため、Context を付けない。
+#   publish-vsix （github Context あり）: workspace 経由で受け取った VSIX を Release に添付する。
+# ビルド済みなら check-version が workspace に skip 印を残し、後続ジョブはそれを見て自己スキップする
+# （circleci-agent step halt は後続ジョブを止めないため）。
 version: 2.1
 
-jobs:
-  build-vsix:
-    parameters:
-      upstream-url:
-        type: string
-        description: 拡張の公式リポジトリの clone URL
-      dir:
-        type: string
-        default: "."
-        description: リポジトリ内の拡張のディレクトリ
-      build:
-        type: string
-        description: VSIX を作るコマンド（dir で実行）
-    docker:
-      - image: cimg/node:22.22
-    resource_class: medium
-    environment:
-      GH_VERSION: 2.102.0
+commands:
+  install-gh:
+    steps:
+      - run:
+          name: Install gh CLI
+          environment:
+            GH_VERSION: 2.102.0
+          command: |
+            curl -fsSL -o /tmp/gh.tgz \
+              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+            tar -xzf /tmp/gh.tgz -C /tmp
+            echo "export PATH=/tmp/gh_${GH_VERSION}_linux_amd64/bin:\$PATH" >> "$BASH_ENV"
+  require-github-token:
     steps:
       - run:
           name: Check GITHUB_TOKEN
@@ -40,14 +45,46 @@ jobs:
               echo "GITHUB_TOKEN is empty. Configure the 'github' context with a token that has contents:write on this repository." >&2
               exit 1
             fi
-            echo "export RELEASE_REPO=${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}" >> "$BASH_ENV"
+  load-meta:
+    parameters:
+      key:
+        type: string
+    steps:
+      - attach_workspace:
+          at: /tmp/ws
       - run:
-          name: Install gh CLI
+          name: Load metadata
           command: |
-            curl -fsSL -o /tmp/gh.tgz \
-              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
-            tar -xzf /tmp/gh.tgz -C /tmp
-            echo "export PATH=/tmp/gh_${GH_VERSION}_linux_amd64/bin:\$PATH" >> "$BASH_ENV"
+            if [ -f /tmp/ws/<< parameters.key >>/skip ]; then
+              echo "ビルド済みのため終了します"
+              circleci-agent step halt
+              exit 0
+            fi
+            cat /tmp/ws/<< parameters.key >>/meta.env >> "$BASH_ENV"
+
+executors:
+  node:
+    docker:
+      - image: cimg/node:22.22
+    resource_class: medium
+
+jobs:
+  check-version:
+    parameters:
+      key:
+        type: string
+        description: workspace 内で拡張ごとに分けるディレクトリ名
+      upstream-url:
+        type: string
+        description: 拡張の公式リポジトリの clone URL
+      dir:
+        type: string
+        default: "."
+        description: リポジトリ内の拡張のディレクトリ
+    executor: node
+    steps:
+      - require-github-token
+      - install-gh
       - run:
           name: Clone upstream
           command: git clone --depth 1 "<< parameters.upstream-url >>" upstream
@@ -55,59 +92,158 @@ jobs:
           name: Check version
           working_directory: upstream/<< parameters.dir >>
           command: |
+            RELEASE_REPO="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
+            # require() で JSON を読むだけで、上流のコードは実行しない
             NAME=$(node -p "require('./package.json').name")
             VERSION=$(node -p "require('./package.json').version")
             TAG="$NAME-v$VERSION"
-            echo "export NAME=$NAME VERSION=$VERSION TAG=$TAG" >> "$BASH_ENV"
+            COMMIT=$(git rev-parse HEAD)
+            UPSTREAM_NAME=$(git remote get-url origin | sed -E 's#https://github.com/##; s#\.git$##')
+            OUT="/tmp/ws/<< parameters.key >>"
+            mkdir -p "$OUT"
+            {
+              printf 'export RELEASE_REPO=%q\n' "$RELEASE_REPO"
+              printf 'export NAME=%q VERSION=%q TAG=%q\n' "$NAME" "$VERSION" "$TAG"
+              printf 'export COMMIT=%q UPSTREAM_NAME=%q\n' "$COMMIT" "$UPSTREAM_NAME"
+            } > "$OUT/meta.env"
             # 404 のときだけ「未ビルド」とみなす。認証エラー等で誤って再ビルドしないよう、
             # それ以外の失敗はジョブを失敗させる。
             if gh api "repos/$RELEASE_REPO/releases/tags/$TAG" >/dev/null 2>/tmp/gh-err.txt; then
-              echo "$TAG はビルド済みのため終了します"
-              circleci-agent step halt
+              echo "$TAG はビルド済みのためスキップします"
+              touch "$OUT/skip"
             elif grep -q "HTTP 404" /tmp/gh-err.txt; then
-              echo "$TAG は未ビルドのためビルドします"
+              echo "$TAG は未ビルドのためビルドします（$UPSTREAM_NAME@$COMMIT）"
             else
               cat /tmp/gh-err.txt >&2
               exit 1
             fi
+      - persist_to_workspace:
+          root: /tmp/ws
+          paths:
+            - << parameters.key >>
+
+  build-vsix:
+    parameters:
+      key:
+        type: string
+      upstream-url:
+        type: string
+      dir:
+        type: string
+        default: "."
+      build:
+        type: string
+        description: VSIX を作るコマンド（dir で実行）
+    executor: node
+    steps:
+      - load-meta:
+          key: << parameters.key >>
+      - run:
+          name: Fetch upstream at checked commit
+          command: |
+            # check-version が見たのと同じコミットをビルドする
+            git init -q upstream
+            cd upstream
+            git remote add origin "<< parameters.upstream-url >>"
+            git fetch -q --depth 1 origin "$COMMIT"
+            git checkout -q FETCH_HEAD
       - run:
           name: Build VSIX
           working_directory: upstream/<< parameters.dir >>
           command: |
             << parameters.build >>
-            mkdir -p /tmp/vsix && cp "$NAME-$VERSION.vsix" /tmp/vsix/
+            OUT="/tmp/ws/<< parameters.key >>"
+            mkdir -p "$OUT"
+            cp "$NAME-$VERSION.vsix" "$OUT/"
       - store_artifacts:
-          path: /tmp/vsix
+          path: /tmp/ws/<< parameters.key >>
           destination: vsix
+      - persist_to_workspace:
+          root: /tmp/ws
+          paths:
+            - << parameters.key >>/*.vsix
+
+  publish-vsix:
+    parameters:
+      key:
+        type: string
+      dir:
+        type: string
+        default: "."
+    executor: node
+    steps:
+      - load-meta:
+          key: << parameters.key >>
+      - require-github-token
+      - install-gh
       - run:
           name: Publish to GitHub Release
-          working_directory: upstream/<< parameters.dir >>
           command: |
-            COMMIT=$(git rev-parse --short HEAD)
-            UPSTREAM_NAME=$(git remote get-url origin | sed -E 's#https://github.com/##; s#\.git$##')
-            gh release create "$TAG" "/tmp/vsix/$NAME-$VERSION.vsix" \
+            ASSET="$NAME-$VERSION.vsix"
+            FILE="/tmp/ws/<< parameters.key >>/$ASSET"
+            if gh release create "$TAG" "$FILE" \
               --repo "$RELEASE_REPO" \
               --title "$NAME v$VERSION" \
-              --notes "Built from $UPSTREAM_NAME@$COMMIT (<< parameters.dir >>)"
+              --notes "Built from $UPSTREAM_NAME@${COMMIT:0:7} (<< parameters.dir >>)"; then
+              exit 0
+            fi
+            # スケジュール実行と push 実行が重なると、別のパイプラインが先に同じタグで
+            # 公開していることがある。公開済みかつ VSIX が添付済みのときだけ成功とみなす。
+            if gh api "repos/$RELEASE_REPO/releases/tags/$TAG" \
+              --jq "(.draft | not) and ([.assets[].name] | index(\"$ASSET\") != null)" 2>/dev/null \
+              | grep -qx true; then
+              echo "$TAG は別のパイプラインで公開済み（$ASSET 添付済み）のため成功とみなします"
+              exit 0
+            fi
+            echo "gh release create failed" >&2
+            exit 1
 
 workflows:
   build:
     jobs:
-      - build-vsix:
-          name: quint
+      # quint
+      - check-version:
+          name: quint-check
           context:
-            # github: GitHub Release の作成に使う GITHUB_TOKEN（contents:write）
+            # github: Release の確認・作成に使う GITHUB_TOKEN（contents:write）
             - github
+          key: quint
+          upstream-url: https://github.com/informalsystems/quint.git
+          dir: vscode/quint-vscode
+      - build-vsix:
+          name: quint-build
+          requires: [quint-check]
+          key: quint
           upstream-url: https://github.com/informalsystems/quint.git
           dir: vscode/quint-vscode
           build: |
             npm ci --no-audit --no-fund   # postinstall で server/ の依存も入る
             npx -y @vscode/vsce package   # vscode:prepublish で tsc -b が走る
-      - build-vsix:
-          name: alloy
+      - publish-vsix:
+          name: quint-publish
+          requires: [quint-build]
           context:
             - github
+          key: quint
+          dir: vscode/quint-vscode
+      # alloy
+      - check-version:
+          name: alloy-check
+          context:
+            - github
+          key: alloy
+          upstream-url: https://github.com/DongyuZhao/vscode-alloy.git
+      - build-vsix:
+          name: alloy-build
+          requires: [alloy-check]
+          key: alloy
           upstream-url: https://github.com/DongyuZhao/vscode-alloy.git
           build: |
             rm -f .vsixmanifest   # リポジトリに残っている古いマニフェストを除去
             npx -y @vscode/vsce package --allow-missing-repository --skip-license
+      - publish-vsix:
+          name: alloy-publish
+          requires: [alloy-build]
+          context:
+            - github
+          key: alloy
