@@ -19,7 +19,7 @@
 #                                          上流や依存パッケージのスクリプトに
 #                                          GITHUB_TOKEN を渡さないため、Context を付けない。
 #   publish-vsix （github Context あり）: workspace 経由で受け取った VSIX を Release に添付する。
-# ビルド済みなら check-version が workspace に skip 印を残し、後続ジョブはそれを見て自己スキップする
+# ビルド済み（Release があり VSIX も添付済み）なら check-version が workspace に skip 印を残し、後続ジョブはそれを見て自己スキップする
 # （circleci-agent step halt は後続ジョブを止めないため）。
 version: 2.1
 
@@ -108,9 +108,16 @@ jobs:
             } > "$OUT/meta.env"
             # 404 のときだけ「未ビルド」とみなす。認証エラー等で誤って再ビルドしないよう、
             # それ以外の失敗はジョブを失敗させる。
-            if gh api "repos/$RELEASE_REPO/releases/tags/$TAG" >/dev/null 2>/tmp/gh-err.txt; then
-              echo "$TAG はビルド済みのためスキップします"
-              touch "$OUT/skip"
+            # Release があっても VSIX が添付されていなければ完成とみなさない。
+            if ASSETS=$(gh api "repos/$RELEASE_REPO/releases/tags/$TAG" \
+              --jq 'select(.draft == false) | .assets[].name' 2>/tmp/gh-err.txt); then
+              if printf '%s\n' "$ASSETS" | grep -Fqx -- "$NAME-$VERSION.vsix"; then
+                echo "$TAG はビルド済みのためスキップします"
+                touch "$OUT/skip"
+              else
+                echo "$TAG の Release はありますが $NAME-$VERSION.vsix が添付されていません。Release を削除するか、VSIX を添付してから再実行してください。" >&2
+                exit 1
+              fi
             elif grep -q "HTTP 404" /tmp/gh-err.txt; then
               echo "$TAG は未ビルドのためビルドします（$UPSTREAM_NAME@$COMMIT）"
             else
